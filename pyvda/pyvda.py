@@ -4,18 +4,21 @@ from ctypes import windll
 from typing import List, Optional
 
 import _ctypes
-from comtypes import GUID
+from comtypes import GUID, COMError
 
 import pyvda.build as build
 from pyvda.com_defns import IApplicationView, IVirtualDesktop, IVirtualDesktop2
 from pyvda.utils import Managers
 from pyvda.winstring import HSTRING
+import traceback
+import logging
 
+import pywintypes
 ASFW_ANY = -1
 NULL_PTR = 0
 
 managers = Managers()
-
+logger = logging.getLogger(__name__)
 
 class AppView():
     """
@@ -396,7 +399,18 @@ class VirtualDesktop():
         """
         if allow_set_foreground:
             windll.user32.AllowSetForegroundWindow(ASFW_ANY)
-        managers.manager_internal.switch_desktop(self._virtual_desktop) # type: ignore
+        try:
+            managers.manager_internal.switch_desktop(self._virtual_desktop)
+        except (pywintypes.com_error, _ctypes.COMError, COMError) as e:
+            traceback.print_exc()
+            hr = getattr(e, "args", [None])[0]
+            if hr == -2147023174:  # RPC server unavailable
+                logger.warning("RPC unavailable in switch_desktop, reinitializing COM…")
+                managers.reinit()
+                managers.manager_internal.switch_desktop(self._virtual_desktop)
+            else:
+                raise
+
 
     def apps_by_z_order(self, include_pinned: bool = True) -> List[AppView]:
         """Get a list of AppViews, ordered by their Z position, with
