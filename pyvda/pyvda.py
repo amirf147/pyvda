@@ -4,12 +4,18 @@ from ctypes import windll
 from typing import List, Optional
 
 import _ctypes
-from comtypes import GUID
+from comtypes import GUID, COMError
 
 import pyvda.build as build
 from pyvda.com_defns import IApplicationView, IVirtualDesktop, IVirtualDesktop2
 from pyvda.utils import Managers
 from pyvda.winstring import HSTRING
+import pywintypes
+
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 ASFW_ANY = -1
 NULL_PTR = 0
@@ -261,73 +267,66 @@ class VirtualDesktop():
             desktop (IVirtualDesktop, optional): An `IVirtualDesktop`. Defaults to None.
             current (bool, optional): The current virtual desktop. Defaults to False.
         """
+        max_retries = 5
+        retry_delay_seconds = 0.25
 
-        if number:
-            if number <= 0:
-                raise ValueError(f"Desktop number must be at least 1, {number} provided")
-            array = managers.manager_internal.get_all_desktops() # type: ignore
-            desktop_count = array.GetCount()
-            if number > desktop_count:
-                raise ValueError(
-                    f"Desktop number {number} exceeds the number of desktops, {desktop_count}."
-                )
-            self._virtual_desktop = array.get_at(number - 1, IVirtualDesktop)
+        for attempt in range(max_retries):
+            try:
+                if number:
+                    if number <= 0:
+                        raise ValueError(f"Desktop number must be at least 1, {number} provided")
+                    array = managers.manager_internal.get_all_desktops() # type: ignore
+                    desktop_count = array.GetCount()
+                    if number > desktop_count:
+                        raise ValueError(
+                            f"Desktop number {number} exceeds the number of desktops, {desktop_count}."
+                        )
+                    self._virtual_desktop = array.get_at(number - 1, IVirtualDesktop)
 
-        elif desktop_id:
-            self._virtual_desktop = managers.manager_internal.FindDesktop(desktop_id) # type: ignore
+                elif desktop_id:
+                    self._virtual_desktop = managers.manager_internal.FindDesktop(desktop_id) # type: ignore
 
-        elif desktop:
-            self._virtual_desktop = desktop
+                elif desktop:
+                    self._virtual_desktop = desktop
 
-        elif current:
-            self._virtual_desktop = managers.manager_internal.get_current_desktop() # type: ignore
+                elif current:
+                    self._virtual_desktop = managers.manager_internal.get_current_desktop() # type: ignore
 
-        else:
-            raise Exception("Must provide one of 'number', 'desktop_id' or 'desktop'")
+                else:
+                    raise Exception("Must provide one of 'number', 'desktop_id' or 'desktop'")
 
-    @classmethod
-    def current(cls):
-        """Convenience method to return a `VirtualDesktop` object for the
-        currently active desktop.
+                # If we got here, everything succeeded. Break the loop.
+                return
 
-        Returns:
-            VirtualDesktop: The current desktop.
-        """
-        return cls(current=True)
+            except (pywintypes.com_error, _ctypes.COMError, COMError) as e:
+                hr = getattr(e, "args", [None])[0]
+                
+                # Check for RPC_S_SERVER_UNAVAILABLE
+                if hr == -2147023174 and (attempt < max_retries - 1):
+                    logger.warning(
+                        f"RPC server unavailable (Attempt {attempt + 1}/{max_retries}), "
+                        f"likely explorer.exe restart. "
+                        f"Re-initializing COM managers and retrying in {retry_delay_seconds}s..."
+                    )
+                    
+                    # This is the critical fix:
+                    # Call __init__ on the Managers() instance.
+                    # Because it's a threading.local, this will re-run the
+                    # init logic for the current thread, fetching NEW manager objects.
+                    try:
+                        managers.refresh_managers()
+                    except Exception as reinit_e:
+                        logger.error(f"Failed to re-initialize COM managers during retry: {reinit_e}")
+                        # If re-init fails, just let the original error propagate up
+                        raise e
 
-    @classmethod
-    def create(cls):
-        """Create a new virtual desktop.
-
-        Returns:
-            VirtualDesktop: The created desktop.
-        """
-        desktop = managers.manager_internal.create_desktop() # type: ignore
-        return cls(desktop=desktop)
-
-    @property
-    def id(self) -> GUID:
-        """The GUID of this desktop.
-
-        Returns:
-            GUID: The unique id for this desktop.
-        """
-        return self._virtual_desktop.GetID() # type: ignore
-
-    @property
-    def number(self) -> int:
-        """The index of this virtual desktop in the task view. Between 1 and
-        the total number of desktops active.
-
-        Returns:
-            int: The desktop number.
-        """
-        array = managers.manager_internal.get_all_desktops() # type: ignore
-        for i, vd in enumerate(array.iter(IVirtualDesktop), 1):
-            if self.id == vd.GetID():
-                return i
-        else:
-            raise Exception(f"Desktop with ID {self.id} not found")
+                    time.sleep(retry_delay_seconds)
+                    retry_delay_seconds *= 2  # Exponential backoff
+                
+                else:
+                    # Not the RPC error, or this was the last retry
+                    logger.error(f"Failed to initialize VirtualDesktop after {attempt + 1} attempts.")
+                    raise e # Re-raise the exception
 
     @property
     def name(self) -> str:

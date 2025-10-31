@@ -72,3 +72,15 @@ class Managers(threading.local):
             # COINIT_MULTITHREADED, whereas CoInitialize uses COINIT_APARTMENTTHREADED.
             # This should not be a problem for us, so warn and keep going.
             logger.warning("Failed to initialise COM: %s", str(e))
+
+    def refresh_managers(self):
+        """
+        Re-acquires all COM objects from the OS.
+        This is the necessary fix after explorer.exe restarts.
+        """
+        logger.info("Refreshing all COM managers for this thread...")
+        self.try_init_com() 
+        self.manager_internal = get_vd_manager_internal()
+        self.view_collection = get_view_collection()
+        self.pinned_apps = get_pinned_apps()
+        self.manager_internal2 = get_vd_manager_internal2()
