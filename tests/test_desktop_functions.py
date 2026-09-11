@@ -7,7 +7,7 @@ import pytest
 import win32gui
 from comtypes import COINIT_MULTITHREADED, CoInitializeEx
 
-from pyvda import AppView, VirtualDesktop, get_apps_by_z_order, get_virtual_desktops
+from pyvda import AppView, VirtualDesktop, get_apps_by_z_order, get_virtual_desktops, sync_pinned_apps
 
 current_window = AppView.current()
 current_desktop = VirtualDesktop.current()
@@ -146,3 +146,16 @@ def test_initialisation_with_com_mta():
     t.join()
     if error is not None:
         raise error
+
+def test_base_app_id():
+    for app in get_apps_by_z_order(False, False):
+        if app.app_id:
+            assert isinstance(app.app_id, str)
+            assert isinstance(app.base_app_id, str)
+            if "~Wh~" in app.app_id:
+                assert app.base_app_id == app.app_id.split("~Wh~")[0]
+            else:
+                assert app.base_app_id == app.app_id
+
+def test_sync_pinned_apps():
+    sync_pinned_apps()

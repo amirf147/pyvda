@@ -61,4 +61,5 @@ from .pyvda import (
     get_apps_by_z_order,
     get_virtual_desktops,
     set_wallpaper_for_all_desktops,
+    sync_pinned_apps,
 )

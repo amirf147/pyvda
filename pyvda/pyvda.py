@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from ctypes import windll
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+import ctypes
 import _ctypes
 from comtypes import GUID
 
@@ -52,16 +53,30 @@ class AppView():
         return self._view.GetThumbnailWindow() # type: ignore
 
     @property
-    def app_id(self) -> Optional[int]:
+    def app_id(self) -> Optional[str]:
         """The ID of this window's app. Some specific types of windows do not have an app ID, and will return `None`.
         """
         try:
             # For certain types of windows, this will raise a COMError with 'Element not found'.
             # This seems to happen for things like window managers which are pinned above the normal windows.
             # Can be reliably reproduced with the 'f.lux' options window.
-            return self._view.GetAppUserModelId() # type: ignore
+            raw = self._view.GetAppUserModelId() # type: ignore
+            if raw is None:
+                return None
+            if isinstance(raw, str):
+                return raw
+            return ctypes.wstring_at(raw)
         except _ctypes.COMError:
             return None
+
+    @property
+    def base_app_id(self) -> Optional[str]:
+        """The canonical application ID, stripped of any window-hosting sub-identifiers (~Wh~).
+        """
+        app_id = self.app_id
+        if not app_id:
+            return None
+        return app_id.split("~Wh~")[0]
 
     @classmethod
     def current(cls):
@@ -126,23 +141,41 @@ class AppView():
 
     def pin_app(self):
         """
-        Pin this window's app (corresponds to the 'show windows from this app on all desktops' toggle).
+        Pin this window's app across all virtual desktops.
+        Pins the canonical app ID and ensures all active windows belonging
+        to this app (including hosted XAML Island windows) are pinned.
         """
-        app_id = self.app_id
+        base_id = self.base_app_id
         # This happens in rare cases. See the comment on app_id for more detail.
         # Returning without doing anything is the best we can do here, and matches the behaviour of the windows UI.
-        if app_id is None:
+        if base_id is None:
             return
-        managers.pinned_apps.PinAppID(self.app_id) # type: ignore
+        managers.pinned_apps.PinAppID(base_id) # type: ignore
+
+        # For applications using XAML Islands / window hosting (~Wh~),
+        # Windows assigns per-window sub-AUMIDs (~Wh~w<HWND>) and checks them
+        # via exact string matching. Pin the views of all active windows
+        # sharing this base app ID so they appear across all desktops immediately.
+        for view in get_apps_by_z_order(switcher_windows=False, current_desktop=False):
+            if view.base_app_id == base_id and view.app_id != base_id:
+                view.pin()
 
     def unpin_app(self):
         """
-        Unpin this window's app (corresponds to the 'show windows from this app on all desktops' toggle).
+        Unpin this window's app across all virtual desktops.
         """
-        app_id = self.app_id
-        if app_id is None:
+        base_id = self.base_app_id
+        if base_id is None:
             return
-        managers.pinned_apps.UnpinAppID(self.app_id) # type: ignore
+        managers.pinned_apps.UnpinAppID(base_id) # type: ignore
+
+        raw_id = self.app_id
+        if raw_id and raw_id != base_id:
+            managers.pinned_apps.UnpinAppID(raw_id) # type: ignore
+
+        for view in get_apps_by_z_order(switcher_windows=False, current_desktop=False):
+            if view.base_app_id == base_id and view.app_id != base_id:
+                view.unpin()
 
     def is_app_pinned(self) -> bool:
         """
@@ -151,10 +184,15 @@ class AppView():
         Returns:
             bool: is the app pinned?.
         """
-        app_id = self.app_id
-        if app_id is None:
-            return
-        return managers.pinned_apps.IsAppIdPinned(self.app_id) # type: ignore
+        base_id = self.base_app_id
+        if base_id is None:
+            return False
+        if managers.pinned_apps.IsAppIdPinned(base_id): # type: ignore
+            return True
+        raw_id = self.app_id
+        if raw_id and raw_id != base_id and managers.pinned_apps.IsAppIdPinned(raw_id): # type: ignore
+            return True
+        return False
 
 
     #  ------------------------------------------------
@@ -240,6 +278,22 @@ def get_apps_by_z_order(switcher_windows: bool = True, current_desktop: bool = T
             continue
         result.append(view)
     return result
+
+
+def sync_pinned_apps():
+    """Ensure all open windows belonging to a pinned application have their views pinned.
+    This handles hosted/XAML Island apps (e.g. Windows Terminal) where Windows COM
+    fails to automatically pin secondary windows due to synthetic ~Wh~ sub-AUMIDs.
+    """
+    pinned_cache: Dict[str, bool] = {}
+    for view in get_apps_by_z_order(switcher_windows=False, current_desktop=False):
+        base_id = view.base_app_id
+        if not base_id or view.app_id == base_id:
+            continue
+        if base_id not in pinned_cache:
+            pinned_cache[base_id] = bool(managers.pinned_apps.IsAppIdPinned(base_id)) # type: ignore
+        if pinned_cache[base_id] and not view.is_pinned():
+            view.pin()
 
 
 class VirtualDesktop():
@@ -396,6 +450,7 @@ class VirtualDesktop():
         """
         if allow_set_foreground:
             windll.user32.AllowSetForegroundWindow(ASFW_ANY)
+        sync_pinned_apps()
         managers.manager_internal.switch_desktop(self._virtual_desktop) # type: ignore
 
     def apps_by_z_order(self, include_pinned: bool = True) -> List[AppView]:
